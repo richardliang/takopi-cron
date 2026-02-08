@@ -78,14 +78,44 @@ class _FakeExecutor:
         raise NotImplementedError
 
 
+class _FakeSlackTransport:
+    def __init__(self) -> None:
+        self.send_calls: list[dict[str, Any]] = []
+
+    async def send(  # type: ignore[no-untyped-def]
+        self,
+        *,
+        channel_id,
+        message,
+        options=None,
+    ):
+        self.send_calls.append(
+            {
+                "channel_id": channel_id,
+                "message": message,
+                "options": options,
+            }
+        )
+        return None
+
+
+class _FakeSlackExecutor(_FakeExecutor):
+    __module__ = "takopi_slack_plugin.commands.executor"
+
+    def __init__(self, *, answer: str, transport: Any, channel_id: str) -> None:
+        super().__init__(answer=answer)
+        self.channel_id = channel_id
+        self.exec_cfg = type("_ExecCfg", (), {"transport": transport})()
+
+
 def _make_ctx(
     *,
     args: tuple[str, ...],
     args_text: str,
     plugin_config: dict[str, Any] | None = None,
     sender_id: int | None = 1,
-    channel_id: int = 123,
-    thread_id: int | None = None,
+    channel_id: int | str = 123,
+    thread_id: int | str | None = None,
     reply_to: MessageRef | None = None,
     reply_text: str | None = None,
     runtime: Any | None = None,
@@ -227,3 +257,52 @@ async def test_notify_config_applies_to_ticks() -> None:
         assert exec_.send_calls[0]["notify"] is False
     finally:
         await MANAGER.stop(key=(ctx.message.channel_id, ctx.message.thread_id))
+
+
+@pytest.mark.anyio
+async def test_slack_cron_ticks_post_top_level_messages_and_replace_per_channel() -> None:
+    transport1 = _FakeSlackTransport()
+    exec1 = _FakeSlackExecutor(answer="RESULT_1", transport=transport1, channel_id="C1")
+    ctx1, _ = _make_ctx(
+        args=("start", "0.00001", "hello"),
+        args_text="start 0.00001 hello",
+        executor=exec1,
+        channel_id="C1",
+        thread_id="t1",
+    )
+
+    transport2 = _FakeSlackTransport()
+    exec2 = _FakeSlackExecutor(answer="RESULT_2", transport=transport2, channel_id="C1")
+    ctx2, _ = _make_ctx(
+        args=("start", "0.00001", "hello again"),
+        args_text="start 0.00001 hello again",
+        executor=exec2,
+        channel_id="C1",
+        thread_id="t2",
+    )
+
+    try:
+        result1 = await BACKEND.handle(ctx1)
+        assert isinstance(result1, CommandResult)
+
+        with anyio.fail_after(1):
+            while len(transport1.send_calls) < 2:
+                await anyio.sleep(0.01)
+        assert transport1.send_calls[0]["options"].thread_id is None
+        assert transport1.send_calls[1]["options"].thread_id is None
+
+        result2 = await BACKEND.handle(ctx2)
+        assert isinstance(result2, CommandResult)
+
+        with anyio.fail_after(1):
+            while len(transport2.send_calls) < 2:
+                await anyio.sleep(0.01)
+        assert transport2.send_calls[0]["options"].thread_id is None
+        assert transport2.send_calls[1]["options"].thread_id is None
+
+        entries = await MANAGER.list()
+        assert len(entries) == 1
+        assert entries[0].key == ("C1", None)
+        assert entries[0].executor is exec2
+    finally:
+        await MANAGER.stop(key=("C1", None))
