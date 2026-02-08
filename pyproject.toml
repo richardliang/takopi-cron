@@ -1,0 +1,38 @@
+[project]
+name = "takopi-cron"
+version = "0.1.0"
+description = "Cron command plugin for Takopi."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "takopi contributors" }]
+requires-python = ">=3.14"
+dependencies = [
+  "takopi>=0.21,<0.22",
+]
+keywords = ["takopi", "cron", "scheduler", "plugin"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://takopi.dev"
+
+[project.entry-points."takopi.command_backends"]
+cron = "takopi_cron.backend:BACKEND"
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+  "pytest>=9.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

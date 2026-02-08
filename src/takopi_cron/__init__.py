@@ -1,0 +1,2 @@
+"""takopi-cron plugin package."""
+
