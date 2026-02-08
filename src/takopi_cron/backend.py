@@ -316,10 +316,13 @@ class CronCommand:
             prompt_text = " ".join(ctx.args[2:]).strip()
             if not prompt_text:
                 raise ConfigError("Usage: /cron start <hours> <prompt...>")
-            spec = _resolve_spec(ctx, hours=hours, prompt_text=prompt_text)
-            reply_to = ctx.reply_to or ctx.message
-            await MANAGER.start(ctx=ctx, spec=spec, reply_to=reply_to)
-            return CommandResult(text=f"cron: started (every {hours:g}h)")
+            return await _start_job(
+                ctx,
+                hours=hours,
+                prompt_text=prompt_text,
+                notify=None,
+                label=None,
+            )
 
         raise ConfigError(f"Unknown subcommand {sub!r}.")
 
@@ -347,6 +350,22 @@ def _resolve_spec(
         context=resolved.context,
         notify=notify,
     )
+
+
+async def _start_job(
+    ctx: CommandContext,
+    *,
+    hours: float,
+    prompt_text: str,
+    notify: bool | None,
+    label: str | None,
+) -> CommandResult:
+    spec = _resolve_spec(ctx, hours=hours, prompt_text=prompt_text, notify=notify)
+    reply_to = ctx.reply_to or ctx.message
+    await MANAGER.start(ctx=ctx, spec=spec, reply_to=reply_to)
+    if label is None:
+        return CommandResult(text=f"cron: started (every {hours:g}h)")
+    return CommandResult(text=f"cron: started {label} (every {hours:g}h)")
 
 
 def _help_text() -> str:
@@ -517,16 +536,12 @@ async def _handle_seed(ctx: CommandContext) -> CommandResult:
         preset = _select_seed(presets, ctx.args[2])
         if preset is None:
             raise ConfigError(f"Unknown seed {ctx.args[2]!r}. Use `/cron seed list`.")
-        spec = _resolve_spec(
+        return await _start_job(
             ctx,
             hours=preset.every_hours,
             prompt_text=preset.prompt,
             notify=preset.notify,
-        )
-        reply_to = ctx.reply_to or ctx.message
-        await MANAGER.start(ctx=ctx, spec=spec, reply_to=reply_to)
-        return CommandResult(
-            text=f"cron: started seed {preset.id} (every {preset.every_hours:g}h)"
+            label=f"seed {preset.id}",
         )
 
     raise ConfigError("Usage: /cron seed list | /cron seed start <id|index>")
