@@ -75,6 +75,8 @@ Seed presets (from config):
 /cron seed start daily_summary
 ```
 
+Seed presets start in the chat/thread where you run the command.
+
 Tips:
 
 - Put an engine directive at the start of the prompt, e.g. `/claude ...`
