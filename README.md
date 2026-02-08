@@ -85,4 +85,13 @@ allowed_user_ids = [12345678]
 
 # Optional: whether cron ticks should notify (default: true)
 notify = true
+
+# Optional: seed jobs that start automatically when takopi starts (telegram only)
+[[plugins.cron.seed]]
+chat_id = -1001234567890
+thread_id = 42 # optional (telegram topics)
+every_hours = 6
+prompt = "/codex summarize what changed since the last cron tick"
+# notify = true            # optional override
+# reply_to_message_id = 1  # optional
 ```

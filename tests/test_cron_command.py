@@ -131,15 +131,16 @@ async def test_start_runs_immediately_and_repeats() -> None:
         assert "cron: started" in result.text
 
         with anyio.fail_after(1):
-            while len(exec_.send_calls) < 1:
-                await anyio.sleep(0.01)
-        assert "cron tick #1" in exec_.send_calls[0]["message"].text
-        assert "RESULT" in exec_.send_calls[0]["message"].text
-
-        with anyio.fail_after(1):
             while len(exec_.send_calls) < 2:
                 await anyio.sleep(0.01)
-        assert "cron tick #2" in exec_.send_calls[1]["message"].text
+        assert "cron tick #1" in exec_.send_calls[0]["message"].text
+        assert exec_.send_calls[1]["message"].text == "RESULT"
+
+        with anyio.fail_after(1):
+            while len(exec_.send_calls) < 4:
+                await anyio.sleep(0.01)
+        assert "cron tick #2" in exec_.send_calls[2]["message"].text
+        assert exec_.send_calls[3]["message"].text == "RESULT"
     finally:
         await MANAGER.stop(key=(ctx.message.channel_id, ctx.message.thread_id))
 
@@ -171,7 +172,7 @@ async def test_stop_prevents_future_ticks() -> None:
 
         # Sleep longer than the interval; no further sends should happen.
         await anyio.sleep(0.6)
-        assert len(exec_.send_calls) == 1
+        assert len(exec_.send_calls) == 2
     finally:
         await MANAGER.stop(key=(ctx.message.channel_id, ctx.message.thread_id))
 
@@ -226,4 +227,3 @@ async def test_notify_config_applies_to_ticks() -> None:
         assert exec_.send_calls[0]["notify"] is False
     finally:
         await MANAGER.stop(key=(ctx.message.channel_id, ctx.message.thread_id))
-

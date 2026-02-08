@@ -11,11 +11,24 @@ from takopi.api import (
     CommandResult,
     CommandExecutor,
     ConfigError,
+    ExecBridgeConfig,
+    HOME_CONFIG_PATH,
+    IncomingMessage,
     MessageRef,
     RenderedMessage,
     RunContext,
     RunRequest,
+    RunResult,
+    RunnerUnavailableError,
+    SendOptions,
+    bind_run_context,
+    clear_context,
     get_logger,
+    handle_message,
+    load_settings,
+    read_config,
+    reset_run_base_dir,
+    set_run_base_dir,
 )
 
 logger = get_logger(__name__)
@@ -23,6 +36,8 @@ logger = get_logger(__name__)
 type ChannelId = int | str
 type ThreadId = int | str | None
 type JobKey = tuple[ChannelId, ThreadId]
+
+_SEED_TASK: asyncio.Task[None] | None = None
 
 
 def _coerce_chat_id(value: Any) -> int | None:
@@ -88,7 +103,7 @@ class _CronEntry:
     key: JobKey
     spec: CronSpec
     executor: CommandExecutor
-    reply_to: MessageRef
+    reply_to: MessageRef | None
     stop: asyncio.Event
     created_at: float
     task: asyncio.Task[None] | None = None
@@ -108,7 +123,7 @@ class CronManager:
         *,
         ctx: CommandContext,
         spec: CronSpec,
-        reply_to: MessageRef,
+        reply_to: MessageRef | None,
     ) -> None:
         key = _key_for(ctx)
         await self.stop(key=key)
@@ -188,9 +203,14 @@ class CronManager:
                 else RenderedMessage(text="(no output)")
             )
             await entry.executor.send(
-                _prefix_tick(rendered, entry=entry),
+                _tick_header(entry),
                 reply_to=entry.reply_to,
                 notify=entry.spec.notify,
+            )
+            await entry.executor.send(
+                rendered,
+                reply_to=entry.reply_to,
+                notify=False,
             )
         except Exception as exc:
             entry.last_error = str(exc) or exc.__class__.__name__
@@ -208,14 +228,10 @@ class CronManager:
             entry.last_finished_at = time.time()
 
 
-def _prefix_tick(message: RenderedMessage, *, entry: _CronEntry) -> RenderedMessage:
+def _tick_header(entry: _CronEntry) -> str:
     hours = entry.spec.every_s / 3600.0
     ts = entry.last_started_at or time.time()
-    header = f"cron tick #{entry.tick_count} (every {hours:g}h) @ {_format_ts(ts)}"
-    body = message.text.strip()
-    if not body:
-        return RenderedMessage(text=header, extra=dict(message.extra))
-    return RenderedMessage(text=f"{header}\n\n{body}", extra=dict(message.extra))
+    return f"cron tick #{entry.tick_count} (every {hours:g}h) @ {_format_ts(ts)}"
 
 
 MANAGER = CronManager()
@@ -393,3 +409,338 @@ def _format_list(entries: list[_CronEntry]) -> str:
 
 
 BACKEND: CommandBackend = CronCommand()
+
+
+class _CaptureTransport:
+    def __init__(self) -> None:
+        self._next_id = 1
+        self.last_message: RenderedMessage | None = None
+
+    async def send(
+        self,
+        *,
+        channel_id: int | str,
+        message: RenderedMessage,
+        options: SendOptions | None = None,
+    ) -> MessageRef:
+        thread_id = options.thread_id if options is not None else None
+        ref = MessageRef(channel_id=channel_id, message_id=self._next_id)
+        self._next_id += 1
+        self.last_message = message
+        return MessageRef(
+            channel_id=ref.channel_id,
+            message_id=ref.message_id,
+            thread_id=thread_id,
+        )
+
+    async def edit(
+        self, *, ref: MessageRef, message: RenderedMessage, wait: bool = True
+    ) -> MessageRef:
+        _ = wait
+        self.last_message = message
+        return ref
+
+    async def delete(self, *, ref: MessageRef) -> bool:
+        _ = ref
+        return True
+
+    async def close(self) -> None:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class _SeedJob:
+    channel_id: ChannelId
+    thread_id: ThreadId
+    reply_to: MessageRef | None
+    every_s: float
+    prompt: str
+    notify: bool
+
+
+@dataclass(slots=True)
+class _SeedExecutor(CommandExecutor):
+    runtime: Any
+    transport: Any
+    presenter: Any
+    channel_id: ChannelId
+    thread_id: ThreadId
+
+    async def send(
+        self,
+        message: RenderedMessage | str,
+        *,
+        reply_to: MessageRef | None = None,
+        notify: bool = True,
+    ) -> MessageRef | None:
+        rendered = (
+            message
+            if isinstance(message, RenderedMessage)
+            else RenderedMessage(text=message)
+        )
+        return await self.transport.send(
+            channel_id=self.channel_id,
+            message=rendered,
+            options=SendOptions(
+                reply_to=reply_to,
+                notify=notify,
+                thread_id=self.thread_id,
+            ),
+        )
+
+    async def run_one(
+        self, request: RunRequest, *, mode: str = "emit"
+    ) -> RunResult:
+        if mode != "capture":
+            raise RuntimeError("Seeded cron jobs only support mode=capture")
+
+        engine = self.runtime.resolve_engine(
+            engine_override=request.engine,
+            context=request.context,
+        )
+        try:
+            entry = self.runtime.resolve_runner(
+                resume_token=None,
+                engine_override=engine,
+            )
+        except RunnerUnavailableError as exc:
+            return RunResult(engine=engine, message=RenderedMessage(text=f"error:\n{exc}"))
+
+        if not entry.available:
+            reason = entry.issue or "engine unavailable"
+            return RunResult(engine=engine, message=RenderedMessage(text=f"error:\n{reason}"))
+
+        try:
+            cwd = self.runtime.resolve_run_cwd(request.context)
+        except ConfigError as exc:
+            return RunResult(engine=engine, message=RenderedMessage(text=f"error:\n{exc}"))
+
+        run_base_token = set_run_base_dir(cwd)
+        try:
+            bind_run_context(
+                engine=engine,
+                project=request.context.project if request.context is not None else None,
+                branch=request.context.branch if request.context is not None else None,
+                cwd=str(cwd) if cwd is not None else None,
+            )
+            capture = _CaptureTransport()
+            exec_cfg = ExecBridgeConfig(
+                transport=capture,
+                presenter=self.presenter,
+                final_notify=False,
+            )
+            context_line = self.runtime.format_context_line(request.context)
+            incoming = IncomingMessage(
+                channel_id=self.channel_id,
+                message_id=0,
+                text=request.prompt,
+                thread_id=self.thread_id,
+            )
+            await handle_message(
+                exec_cfg,
+                runner=entry.runner,
+                incoming=incoming,
+                resume_token=None,
+                context=request.context,
+                context_line=context_line,
+                strip_resume_line=self.runtime.is_resume_line,
+                running_tasks=None,
+                on_thread_known=None,
+            )
+            return RunResult(engine=engine, message=capture.last_message)
+        finally:
+            reset_run_base_dir(run_base_token)
+            clear_context()
+
+    async def run_many(self, *args: Any, **kwargs: Any) -> list[RunResult]:
+        _ = args, kwargs
+        raise NotImplementedError
+
+
+def _parse_seed_jobs(config: dict[str, Any]) -> list[_SeedJob]:
+    plugins = config.get("plugins")
+    if not isinstance(plugins, dict):
+        return []
+    cron_cfg = plugins.get("cron")
+    if not isinstance(cron_cfg, dict):
+        return []
+    seeds = cron_cfg.get("seed")
+    if seeds is None:
+        return []
+    if not isinstance(seeds, list):
+        raise ConfigError("Invalid `plugins.cron.seed`; expected an array of tables.")
+
+    notify_default = _optional_bool(cron_cfg, "notify")
+    notify_default = True if notify_default is None else notify_default
+
+    jobs: list[_SeedJob] = []
+    for idx, raw in enumerate(seeds):
+        if not isinstance(raw, dict):
+            raise ConfigError(
+                f"Invalid `plugins.cron.seed[{idx}]`; expected a table."
+            )
+        if raw.get("enabled") is False:
+            continue
+
+        channel_id = raw.get("channel_id")
+        if channel_id is None:
+            channel_id = raw.get("chat_id")
+        if not isinstance(channel_id, (int, str)):
+            raise ConfigError(
+                f"Invalid `plugins.cron.seed[{idx}].chat_id`; expected int or str."
+            )
+
+        thread_id = raw.get("thread_id")
+        if thread_id is not None and not isinstance(thread_id, (int, str)):
+            raise ConfigError(
+                f"Invalid `plugins.cron.seed[{idx}].thread_id`; expected int or str."
+            )
+
+        every_hours = raw.get("every_hours")
+        if not isinstance(every_hours, (int, float)):
+            raise ConfigError(
+                f"Invalid `plugins.cron.seed[{idx}].every_hours`; expected a number."
+            )
+        if every_hours <= 0:
+            raise ConfigError(
+                f"Invalid `plugins.cron.seed[{idx}].every_hours`; must be > 0."
+            )
+
+        prompt = raw.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ConfigError(
+                f"Invalid `plugins.cron.seed[{idx}].prompt`; expected a string."
+            )
+
+        notify = raw.get("notify")
+        if notify is None:
+            notify = notify_default
+        if not isinstance(notify, bool):
+            raise ConfigError(
+                f"Invalid `plugins.cron.seed[{idx}].notify`; expected a boolean."
+            )
+
+        reply_to = None
+        reply_to_id = raw.get("reply_to_message_id")
+        if reply_to_id is not None:
+            if not isinstance(reply_to_id, int):
+                raise ConfigError(
+                    f"Invalid `plugins.cron.seed[{idx}].reply_to_message_id`; expected int."
+                )
+            reply_to = MessageRef(
+                channel_id=channel_id,
+                message_id=reply_to_id,
+                thread_id=thread_id,
+            )
+
+        jobs.append(
+            _SeedJob(
+                channel_id=channel_id,
+                thread_id=thread_id,
+                reply_to=reply_to,
+                every_s=float(every_hours) * 3600.0,
+                prompt=prompt.strip(),
+                notify=notify,
+            )
+        )
+    return jobs
+
+
+async def _start_seeded_jobs() -> None:
+    try:
+        raw = read_config(HOME_CONFIG_PATH)
+    except ConfigError as exc:
+        logger.debug("cron.seed.config_unavailable", error=str(exc))
+        return
+    try:
+        jobs = _parse_seed_jobs(raw)
+    except ConfigError as exc:
+        logger.warning("cron.seed.config_invalid", error=str(exc))
+        return
+    if not jobs:
+        return
+
+    try:
+        settings, config_path = load_settings()
+    except ConfigError as exc:
+        logger.warning("cron.seed.settings_invalid", error=str(exc))
+        return
+
+    if settings.transport != "telegram":
+        logger.info("cron.seed.skip_transport", transport=settings.transport)
+        return
+
+    # Import transport-specific pieces lazily.
+    from takopi.runtime_loader import build_runtime_spec
+    from takopi.telegram.bridge import TelegramPresenter, TelegramTransport
+    from takopi.telegram.client_api import HttpBotClient
+
+    try:
+        spec = build_runtime_spec(settings=settings, config_path=config_path)
+    except ConfigError as exc:
+        logger.warning("cron.seed.runtime_invalid", error=str(exc))
+        return
+    runtime = spec.to_runtime(config_path=config_path)
+
+    presenter = TelegramPresenter(message_overflow=settings.transports.telegram.message_overflow)
+    transport = TelegramTransport(HttpBotClient(settings.transports.telegram.bot_token))
+
+    for job in jobs:
+        if not isinstance(job.channel_id, int):
+            logger.warning("cron.seed.skip_job_channel_type", channel_id=str(job.channel_id))
+            continue
+        if job.thread_id is not None and not isinstance(job.thread_id, int):
+            logger.warning("cron.seed.skip_job_thread_type", thread_id=str(job.thread_id))
+            continue
+        resolved = runtime.resolve_message(
+            text=job.prompt,
+            reply_text=None,
+            ambient_context=None,
+            chat_id=job.channel_id,
+        )
+        spec = CronSpec(
+            every_s=job.every_s,
+            prompt=resolved.prompt or "continue",
+            engine=resolved.engine_override,
+            context=resolved.context,
+            notify=job.notify,
+        )
+        executor = _SeedExecutor(
+            runtime=runtime,
+            transport=transport,
+            presenter=presenter,
+            channel_id=job.channel_id,
+            thread_id=job.thread_id,
+        )
+        ctx = CommandContext(
+            command="cron",
+            text="",
+            args_text="",
+            args=(),
+            message=MessageRef(
+                channel_id=job.channel_id,
+                message_id=0,
+                thread_id=job.thread_id,
+            ),
+            reply_to=None,
+            reply_text=None,
+            config_path=config_path,
+            plugin_config={},
+            runtime=runtime,
+            executor=executor,
+        )
+        await MANAGER.start(ctx=ctx, spec=spec, reply_to=job.reply_to)
+
+
+def _maybe_schedule_seeded_jobs() -> None:
+    global _SEED_TASK
+    if _SEED_TASK is not None:
+        return
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _SEED_TASK = asyncio.create_task(_start_seeded_jobs())
+
+
+_maybe_schedule_seeded_jobs()
