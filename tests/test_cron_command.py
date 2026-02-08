@@ -102,10 +102,54 @@ class _FakeSlackTransport:
 class _FakeSlackExecutor(_FakeExecutor):
     __module__ = "takopi_slack_plugin.commands.executor"
 
-    def __init__(self, *, answer: str, transport: Any, channel_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        answer: str,
+        transport: Any,
+        channel_id: str,
+        user_msg_id: str,
+        thread_id: str | None,
+    ) -> None:
         super().__init__(answer=answer)
         self.channel_id = channel_id
+        self.user_msg_id = user_msg_id
+        self.thread_id = thread_id
         self.exec_cfg = type("_ExecCfg", (), {"transport": transport})()
+
+    async def send(  # type: ignore[no-untyped-def]
+        self,
+        message,
+        *,
+        reply_to=None,
+        notify=True,
+    ):
+        from takopi.api import SendOptions
+
+        rendered = (
+            message
+            if isinstance(message, RenderedMessage)
+            else RenderedMessage(text=message)
+        )
+        reply_ref = (
+            MessageRef(
+                channel_id=self.channel_id,
+                message_id=self.user_msg_id,
+                thread_id=self.thread_id,
+            )
+            if reply_to is None
+            else reply_to
+        )
+        await self.exec_cfg.transport.send(
+            channel_id=self.channel_id,
+            message=rendered,
+            options=SendOptions(
+                reply_to=reply_ref,
+                notify=notify,
+                thread_id=self.thread_id,
+            ),
+        )
+        return None
 
 
 def _make_ctx(
@@ -260,9 +304,15 @@ async def test_notify_config_applies_to_ticks() -> None:
 
 
 @pytest.mark.anyio
-async def test_slack_cron_ticks_post_top_level_messages_and_replace_per_channel() -> None:
+async def test_slack_cron_ticks_post_in_threads_and_key_by_thread() -> None:
     transport1 = _FakeSlackTransport()
-    exec1 = _FakeSlackExecutor(answer="RESULT_1", transport=transport1, channel_id="C1")
+    exec1 = _FakeSlackExecutor(
+        answer="RESULT_1",
+        transport=transport1,
+        channel_id="C1",
+        user_msg_id="m1",
+        thread_id="t1",
+    )
     ctx1, _ = _make_ctx(
         args=("start", "0.00001", "hello"),
         args_text="start 0.00001 hello",
@@ -272,7 +322,13 @@ async def test_slack_cron_ticks_post_top_level_messages_and_replace_per_channel(
     )
 
     transport2 = _FakeSlackTransport()
-    exec2 = _FakeSlackExecutor(answer="RESULT_2", transport=transport2, channel_id="C1")
+    exec2 = _FakeSlackExecutor(
+        answer="RESULT_2",
+        transport=transport2,
+        channel_id="C1",
+        user_msg_id="m2",
+        thread_id="t2",
+    )
     ctx2, _ = _make_ctx(
         args=("start", "0.00001", "hello again"),
         args_text="start 0.00001 hello again",
@@ -288,8 +344,8 @@ async def test_slack_cron_ticks_post_top_level_messages_and_replace_per_channel(
         with anyio.fail_after(1):
             while len(transport1.send_calls) < 2:
                 await anyio.sleep(0.01)
-        assert transport1.send_calls[0]["options"].thread_id is None
-        assert transport1.send_calls[1]["options"].thread_id is None
+        assert transport1.send_calls[0]["options"].thread_id == "t1"
+        assert transport1.send_calls[1]["options"].thread_id == "t1"
 
         result2 = await BACKEND.handle(ctx2)
         assert isinstance(result2, CommandResult)
@@ -297,15 +353,16 @@ async def test_slack_cron_ticks_post_top_level_messages_and_replace_per_channel(
         with anyio.fail_after(1):
             while len(transport2.send_calls) < 2:
                 await anyio.sleep(0.01)
-        assert transport2.send_calls[0]["options"].thread_id is None
-        assert transport2.send_calls[1]["options"].thread_id is None
+        assert transport2.send_calls[0]["options"].thread_id == "t2"
+        assert transport2.send_calls[1]["options"].thread_id == "t2"
 
         entries = await MANAGER.list()
-        assert len(entries) == 1
-        assert entries[0].key == ("C1", None)
-        assert entries[0].executor is exec2
+        assert len(entries) == 2
+        keys = {entry.key for entry in entries}
+        assert keys == {("C1", "t1"), ("C1", "t2")}
     finally:
-        await MANAGER.stop(key=("C1", None))
+        await MANAGER.stop(key=("C1", "t1"))
+        await MANAGER.stop(key=("C1", "t2"))
 
 
 @pytest.mark.anyio

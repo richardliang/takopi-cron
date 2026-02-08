@@ -15,7 +15,6 @@ from takopi.api import (
     RenderedMessage,
     RunContext,
     RunRequest,
-    SendOptions,
     get_logger,
 )
 
@@ -71,58 +70,8 @@ def _format_ts(ts: float) -> str:
 
 
 def _key_for(ctx: CommandContext) -> JobKey:
-    # Per chat + thread for transports with native thread semantics (Telegram
-    # topics, etc).
-    #
-    # Slack is special: Takopi's Slack bridge threads *all* bot responses under
-    # the triggering message by default (it uses `thread_id = message.ts` even
-    # for channel-root messages). For cron jobs we want a single job per Slack
-    # channel and we want tick outputs to be top-level messages, not thread
-    # replies.
-    if _is_slack_executor(ctx.executor):
-        return (ctx.message.channel_id, None)
+    # Per chat + thread (Telegram topics / Slack threads).
     return (ctx.message.channel_id, ctx.message.thread_id)
-
-
-def _is_slack_executor(executor: CommandExecutor) -> bool:
-    mod = executor.__class__.__module__
-    return mod.startswith("takopi_slack_plugin.")
-
-
-def _slack_transport(executor: CommandExecutor) -> Any | None:
-    exec_cfg = getattr(executor, "exec_cfg", None)
-    if exec_cfg is None:
-        return None
-    return getattr(exec_cfg, "transport", None)
-
-
-async def _send_cron_message(
-    *,
-    executor: CommandExecutor,
-    channel_id: ChannelId,
-    message: RenderedMessage | str,
-    reply_to: MessageRef | None,
-    notify: bool,
-) -> MessageRef | None:
-    if _is_slack_executor(executor):
-        transport = _slack_transport(executor)
-        if transport is not None:
-            rendered = (
-                message
-                if isinstance(message, RenderedMessage)
-                else RenderedMessage(text=message)
-            )
-            # Force top-level messages on Slack by omitting thread_id. The Slack
-            # transport ignores reply_to and only uses thread_id.
-            return await transport.send(
-                channel_id=channel_id,
-                message=rendered,
-                options=SendOptions(
-                    notify=notify,
-                    thread_id=None,
-                ),
-            )
-    return await executor.send(message, reply_to=reply_to, notify=notify)
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,17 +195,13 @@ class CronManager:
                 if result.message is not None
                 else RenderedMessage(text="(no output)")
             )
-            await _send_cron_message(
-                executor=entry.executor,
-                channel_id=entry.key[0],
-                message=_tick_header(entry),
+            await entry.executor.send(
+                _tick_header(entry),
                 reply_to=entry.reply_to,
                 notify=entry.spec.notify,
             )
-            await _send_cron_message(
-                executor=entry.executor,
-                channel_id=entry.key[0],
-                message=rendered,
+            await entry.executor.send(
+                rendered,
                 reply_to=entry.reply_to,
                 notify=False,
             )
@@ -267,10 +212,8 @@ class CronManager:
                 error=entry.last_error,
                 error_type=exc.__class__.__name__,
             )
-            await _send_cron_message(
-                executor=entry.executor,
-                channel_id=entry.key[0],
-                message=f"cron error:\n{entry.last_error}",
+            await entry.executor.send(
+                f"cron error:\n{entry.last_error}",
                 reply_to=entry.reply_to,
                 notify=True,
             )
@@ -359,10 +302,8 @@ class CronCommand:
                 if result.message is not None
                 else RenderedMessage(text="(no output)")
             )
-            await _send_cron_message(
-                executor=ctx.executor,
-                channel_id=ctx.message.channel_id,
-                message=rendered,
+            await ctx.executor.send(
+                rendered,
                 reply_to=ctx.reply_to or ctx.message,
                 notify=True,
             )
