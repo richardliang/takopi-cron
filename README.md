@@ -1,32 +1,47 @@
 # takopi-cron
 
-`takopi-cron` is a Takopi **command plugin** that can run a prompt on an interval
-and post results back into your chat.
+cron command plugin for takopi. run a prompt on an interval and post results back into your chat.
 
 This is intentionally simple:
 
 - It runs **in-process** inside Takopi (so Takopi must be running).
 - It does **not** survive restarts (you re-run `/cron start` after restart).
 
-## Install
+## requirements
+
+`uv` for installation (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
+
+python 3.14+ (`uv python install 3.14`)
+
+takopi installed
+
+## install
+
+recommended (installs the plugin into takopi's `uv tool` environment):
 
 ```sh
-pip install takopi-cron
+uv tool install -U takopi --with takopi-cron
 ```
 
-Enable it (optional allowlist):
+if you installed takopi via `pip` (or you're running takopi from a project venv), install the plugin into the same environment:
+
+```sh
+pip install -U takopi-cron
+```
+
+enable it:
 
 ```toml
 [plugins]
 enabled = ["takopi-cron"]
 ```
 
-## Usage
+## usage
 
 Start a job (runs once immediately, then repeats):
 
 ```text
-/cron start 6 Write a summary of today’s PRs and what I should review next.
+/cron start 6 Write a summary of today's PRs and what I should review next.
 ```
 
 Stop the job for the current chat/thread:
@@ -59,7 +74,7 @@ Tips:
 - Put a project directive at the start of the prompt, e.g. `/myproj ...`
 - Put a branch directive at the start of the prompt, e.g. `@feat/foo ...`
 
-## Config
+## config
 
 In `~/.takopi/takopi.toml`:
 
@@ -71,4 +86,3 @@ allowed_user_ids = [12345678]
 # Optional: whether cron ticks should notify (default: true)
 notify = true
 ```
-
