@@ -68,6 +68,13 @@ Run once (no scheduling):
 /cron run What changed since yesterday?
 ```
 
+Seed presets (from config):
+
+```text
+/cron seed list
+/cron seed start daily_summary
+```
+
 Tips:
 
 - Put an engine directive at the start of the prompt, e.g. `/claude ...`
@@ -86,12 +93,12 @@ allowed_user_ids = [12345678]
 # Optional: whether cron ticks should notify (default: true)
 notify = true
 
-# Optional: seed jobs that start automatically when takopi starts (telegram only)
+# Optional: seed presets (saved cron definitions). they do not auto-start; you
+# start them later with `/cron seed start ...`.
 [[plugins.cron.seed]]
-chat_id = -1001234567890
-thread_id = 42 # optional (telegram topics)
+id = "daily_summary"
 every_hours = 6
 prompt = "/codex summarize what changed since the last cron tick"
 # notify = true            # optional override
-# reply_to_message_id = 1  # optional
+# enabled = false          # optional
 ```

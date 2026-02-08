@@ -306,3 +306,52 @@ async def test_slack_cron_ticks_post_top_level_messages_and_replace_per_channel(
         assert entries[0].executor is exec2
     finally:
         await MANAGER.stop(key=("C1", None))
+
+
+@pytest.mark.anyio
+async def test_seed_list_and_seed_start_runs() -> None:
+    plugin_config = {
+        "notify": False,
+        "seed": [
+            {
+                "id": "quick",
+                "every_hours": 0.00001,
+                "prompt": "hello from seed",
+                "notify": True,
+            },
+            {"every_hours": 1, "prompt": "disabled", "enabled": False},
+        ],
+    }
+
+    list_ctx, _ = _make_ctx(
+        args=("seed", "list"),
+        args_text="seed list",
+        plugin_config=plugin_config,
+        channel_id=105,
+    )
+    listed = await BACKEND.handle(list_ctx)
+    assert isinstance(listed, CommandResult)
+    assert "seed presets" in listed.text
+    assert "quick" in listed.text
+
+    start_ctx, exec_ = _make_ctx(
+        args=("seed", "start", "quick"),
+        args_text="seed start quick",
+        plugin_config=plugin_config,
+        executor=_FakeExecutor(answer="RESULT"),
+        channel_id=105,
+    )
+    try:
+        started = await BACKEND.handle(start_ctx)
+        assert isinstance(started, CommandResult)
+        assert "started seed quick" in started.text
+
+        with anyio.fail_after(1):
+            while len(exec_.send_calls) < 2:
+                await anyio.sleep(0.01)
+        assert "cron tick #1" in exec_.send_calls[0]["message"].text
+        assert exec_.send_calls[0]["notify"] is True
+        assert exec_.send_calls[1]["message"].text == "RESULT"
+        assert exec_.send_calls[1]["notify"] is False
+    finally:
+        await MANAGER.stop(key=(start_ctx.message.channel_id, start_ctx.message.thread_id))
