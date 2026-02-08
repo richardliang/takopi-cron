@@ -9,6 +9,7 @@ from takopi.api import (
     CommandBackend,
     CommandContext,
     CommandResult,
+    CommandExecutor,
     ConfigError,
     MessageRef,
     RenderedMessage,
@@ -18,6 +19,10 @@ from takopi.api import (
 )
 
 logger = get_logger(__name__)
+
+type ChannelId = int | str
+type ThreadId = int | str | None
+type JobKey = tuple[ChannelId, ThreadId]
 
 
 def _coerce_chat_id(value: Any) -> int | None:
@@ -64,7 +69,7 @@ def _format_ts(ts: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
-def _key_for(ctx: CommandContext) -> tuple[Any, Any]:
+def _key_for(ctx: CommandContext) -> JobKey:
     # Per chat + thread (Telegram topics / Slack threads).
     return (ctx.message.channel_id, ctx.message.thread_id)
 
@@ -80,13 +85,13 @@ class CronSpec:
 
 @dataclass(slots=True)
 class _CronEntry:
-    key: tuple[Any, Any]
+    key: JobKey
     spec: CronSpec
-    executor: Any
+    executor: CommandExecutor
     reply_to: MessageRef
     stop: asyncio.Event
-    task: asyncio.Task[None]
     created_at: float
+    task: asyncio.Task[None] | None = None
     tick_count: int = 0
     last_started_at: float | None = None
     last_finished_at: float | None = None
@@ -95,7 +100,7 @@ class _CronEntry:
 
 class CronManager:
     def __init__(self) -> None:
-        self._entries: dict[tuple[Any, Any], _CronEntry] = {}
+        self._entries: dict[JobKey, _CronEntry] = {}
         self._lock = asyncio.Lock()
 
     async def start(
@@ -109,33 +114,35 @@ class CronManager:
         await self.stop(key=key)
 
         stop = asyncio.Event()
-        task = asyncio.create_task(self._loop(key=key, ctx=ctx, spec=spec, stop=stop))
-        entry = _CronEntry(
-            key=key,
-            spec=spec,
-            executor=ctx.executor,
-            reply_to=reply_to,
-            stop=stop,
-            task=task,
-            created_at=time.time(),
-        )
         async with self._lock:
+            entry = _CronEntry(
+                key=key,
+                spec=spec,
+                executor=ctx.executor,
+                reply_to=reply_to,
+                stop=stop,
+                created_at=time.time(),
+            )
+            entry.task = asyncio.create_task(self._loop(entry=entry))
             self._entries[key] = entry
 
-    async def stop(self, *, key: tuple[Any, Any]) -> bool:
+    async def stop(self, *, key: JobKey) -> bool:
         async with self._lock:
             entry = self._entries.pop(key, None)
         if entry is None:
             return False
         entry.stop.set()
+        if entry.task is not None:
+            entry.task.cancel()
         try:
-            await entry.task
+            if entry.task is not None:
+                await entry.task
         except asyncio.CancelledError:
             # Stop is best-effort; cancellation should not leak.
             pass
         return True
 
-    async def get(self, *, key: tuple[Any, Any]) -> _CronEntry | None:
+    async def get(self, *, key: JobKey) -> _CronEntry | None:
         async with self._lock:
             return self._entries.get(key)
 
@@ -146,40 +153,32 @@ class CronManager:
     async def _loop(
         self,
         *,
-        key: tuple[Any, Any],
-        ctx: CommandContext,
-        spec: CronSpec,
-        stop: asyncio.Event,
+        entry: _CronEntry,
     ) -> None:
         # Run once immediately, then sleep.
-        while not stop.is_set():
-            await self._tick(key=key, ctx=ctx, spec=spec)
+        while not entry.stop.is_set():
+            await self._tick(entry=entry)
             try:
-                await asyncio.wait_for(stop.wait(), timeout=spec.every_s)
-            except asyncio.TimeoutError:
+                await asyncio.wait_for(entry.stop.wait(), timeout=entry.spec.every_s)
+            except TimeoutError:
                 continue
             break
 
     async def _tick(
         self,
         *,
-        key: tuple[Any, Any],
-        ctx: CommandContext,
-        spec: CronSpec,
+        entry: _CronEntry,
     ) -> None:
-        entry = await self.get(key=key)
-        if entry is None:
-            return
         entry.tick_count += 1
         entry.last_started_at = time.time()
         entry.last_error = None
 
         try:
-            result = await ctx.executor.run_one(
+            result = await entry.executor.run_one(
                 RunRequest(
-                    prompt=spec.prompt,
-                    engine=spec.engine,
-                    context=spec.context,
+                    prompt=entry.spec.prompt,
+                    engine=entry.spec.engine,
+                    context=entry.spec.context,
                 ),
                 mode="capture",
             )
@@ -188,10 +187,10 @@ class CronManager:
                 if result.message is not None
                 else RenderedMessage(text="(no output)")
             )
-            await ctx.executor.send(
-                _prefix_tick(rendered, entry=entry, spec=spec),
+            await entry.executor.send(
+                _prefix_tick(rendered, entry=entry),
                 reply_to=entry.reply_to,
-                notify=spec.notify,
+                notify=entry.spec.notify,
             )
         except Exception as exc:
             entry.last_error = str(exc) or exc.__class__.__name__
@@ -200,7 +199,7 @@ class CronManager:
                 error=entry.last_error,
                 error_type=exc.__class__.__name__,
             )
-            await ctx.executor.send(
+            await entry.executor.send(
                 f"cron error:\n{entry.last_error}",
                 reply_to=entry.reply_to,
                 notify=True,
@@ -209,14 +208,14 @@ class CronManager:
             entry.last_finished_at = time.time()
 
 
-def _prefix_tick(message: RenderedMessage, *, entry: _CronEntry, spec: CronSpec) -> str:
-    hours = spec.every_s / 3600.0
+def _prefix_tick(message: RenderedMessage, *, entry: _CronEntry) -> RenderedMessage:
+    hours = entry.spec.every_s / 3600.0
     ts = entry.last_started_at or time.time()
     header = f"cron tick #{entry.tick_count} (every {hours:g}h) @ {_format_ts(ts)}"
     body = message.text.strip()
     if not body:
-        return header
-    return f"{header}\n\n{body}"
+        return RenderedMessage(text=header, extra=dict(message.extra))
+    return RenderedMessage(text=f"{header}\n\n{body}", extra=dict(message.extra))
 
 
 MANAGER = CronManager()

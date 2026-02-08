@@ -31,8 +31,12 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
   "pytest>=9.0.0",
+  "pytest-anyio>=0.0.0",
+  "ruff>=0.14.10",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.ruff.lint]
+extend-select = ["B", "BLE001", "C4", "PERF", "RUF043", "S110", "SIM", "UP"]
