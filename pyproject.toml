@@ -1,13 +1,13 @@
 [project]
 name = "takopi-cron"
-version = "0.0.2"
+version = "0.0.3"
 description = "Cron command plugin for Takopi."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "takopi contributors" }]
 requires-python = ">=3.14"
 dependencies = [
-  "takopi>=0.21,<0.22",
+  "takopi>=0.22,<0.23",
 ]
 keywords = ["takopi", "cron", "scheduler", "plugin"]
 classifiers = [
