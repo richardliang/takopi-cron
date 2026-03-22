@@ -73,9 +73,11 @@ Seed presets (from config):
 ```text
 /cron seed list
 /cron seed start daily_summary
+/cron start seed
 ```
 
-Seed presets start in the chat/thread where you run the command.
+Seed presets start in the chat/thread where you run the command. `/cron start seed`
+starts every seed preset at once in that chat/thread.
 
 Tips:
 
@@ -95,12 +97,28 @@ allowed_user_ids = [12345678]
 # Optional: whether cron ticks should notify (default: true)
 notify = true
 
-# Optional: seed presets (saved cron definitions). they do not auto-start; you
-# start them later with `/cron seed start ...`.
-[[plugins.cron.seed]]
-id = "daily_summary"
+# Optional: where seed preset files live. Defaults to ~/.takopi/cron-seeds.
+# Relative paths resolve from the directory containing takopi.toml.
+# seed_dir = "cron-seeds"
+```
+
+Seed presets are no longer defined inline in `takopi.toml`. Put them in
+`~/.takopi/cron-seeds/` instead.
+
+Example seed files:
+
+`~/.takopi/cron-seeds/daily_summary.toml`
+
+```toml
 every_hours = 6
-prompt = "/codex summarize what changed since the last cron tick"
+prompt_file = "daily_summary.prompt.md"
+# id = "daily_summary"     # optional; defaults to the file name
 # notify = true            # optional override
 # enabled = false          # optional
+```
+
+`~/.takopi/cron-seeds/daily_summary.prompt.md`
+
+```text
+/codex summarize what changed since the last cron tick
 ```

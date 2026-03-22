@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+import tomllib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from takopi.api import (
@@ -23,6 +25,7 @@ logger = get_logger(__name__)
 type ChannelId = int | str
 type ThreadId = int | str | None
 type JobKey = tuple[ChannelId, ThreadId]
+type EntryKey = tuple[JobKey, str]
 
 
 def _coerce_chat_id(value: Any) -> int | None:
@@ -89,11 +92,14 @@ class SeedPreset:
     every_hours: float
     prompt: str
     notify: bool
+    source_path: Path
 
 
 @dataclass(slots=True)
 class _CronEntry:
     key: JobKey
+    entry_id: str
+    label: str | None
     spec: CronSpec
     executor: CommandExecutor
     reply_to: MessageRef | None
@@ -108,23 +114,27 @@ class _CronEntry:
 
 class CronManager:
     def __init__(self) -> None:
-        self._entries: dict[JobKey, _CronEntry] = {}
+        self._entries: dict[EntryKey, _CronEntry] = {}
         self._lock = asyncio.Lock()
 
     async def start(
         self,
         *,
         ctx: CommandContext,
+        entry_id: str,
+        label: str | None,
         spec: CronSpec,
         reply_to: MessageRef | None,
     ) -> None:
         key = _key_for(ctx)
-        await self.stop(key=key)
+        await self.stop(key=key, entry_id=entry_id)
 
         stop = asyncio.Event()
         async with self._lock:
             entry = _CronEntry(
                 key=key,
+                entry_id=entry_id,
+                label=label,
                 spec=spec,
                 executor=ctx.executor,
                 reply_to=reply_to,
@@ -132,13 +142,35 @@ class CronManager:
                 created_at=time.time(),
             )
             entry.task = asyncio.create_task(self._loop(entry=entry))
-            self._entries[key] = entry
+            self._entries[(key, entry_id)] = entry
 
-    async def stop(self, *, key: JobKey) -> bool:
+    async def stop(self, *, key: JobKey, entry_id: str) -> bool:
         async with self._lock:
-            entry = self._entries.pop(key, None)
+            entry = self._entries.pop((key, entry_id), None)
         if entry is None:
             return False
+        await self._stop_entry(entry)
+        return True
+
+    async def stop_all(self, *, key: JobKey) -> int:
+        async with self._lock:
+            selected_keys = [entry_key for entry_key in self._entries if entry_key[0] == key]
+            entries = [self._entries.pop(entry_key) for entry_key in selected_keys]
+        for entry in entries:
+            await self._stop_entry(entry)
+        return len(entries)
+
+    async def get(self, *, key: JobKey) -> list[_CronEntry]:
+        async with self._lock:
+            entries = [entry for (scope, _), entry in self._entries.items() if scope == key]
+        return sorted(entries, key=_entry_sort_key)
+
+    async def list(self) -> list[_CronEntry]:
+        async with self._lock:
+            entries = list(self._entries.values())
+        return sorted(entries, key=_entry_sort_key)
+
+    async def _stop_entry(self, entry: _CronEntry) -> None:
         entry.stop.set()
         if entry.task is not None:
             entry.task.cancel()
@@ -148,15 +180,6 @@ class CronManager:
         except asyncio.CancelledError:
             # Stop is best-effort; cancellation should not leak.
             pass
-        return True
-
-    async def get(self, *, key: JobKey) -> _CronEntry | None:
-        async with self._lock:
-            return self._entries.get(key)
-
-    async def list(self) -> list[_CronEntry]:
-        async with self._lock:
-            return list(self._entries.values())
 
     async def _loop(
         self,
@@ -224,7 +247,8 @@ class CronManager:
 def _tick_header(entry: _CronEntry) -> str:
     hours = entry.spec.every_s / 3600.0
     ts = entry.last_started_at or time.time()
-    return f"cron tick #{entry.tick_count} (every {hours:g}h) @ {_format_ts(ts)}"
+    prefix = f"cron {entry.label} tick" if entry.label else "cron tick"
+    return f"{prefix} #{entry.tick_count} (every {hours:g}h) @ {_format_ts(ts)}"
 
 
 MANAGER = CronManager()
@@ -272,12 +296,12 @@ class CronCommand:
         key = _key_for(ctx)
 
         if sub in {"stop", "off"}:
-            stopped = await MANAGER.stop(key=key)
+            stopped = await MANAGER.stop_all(key=key)
             return CommandResult(text="cron: stopped" if stopped else "cron: not running")
 
         if sub == "status":
-            entry = await MANAGER.get(key=key)
-            return CommandResult(text=_format_status(entry))
+            entries = await MANAGER.get(key=key)
+            return CommandResult(text=_format_status(entries))
 
         if sub == "list":
             entries = await MANAGER.list()
@@ -310,6 +334,8 @@ class CronCommand:
             return None
 
         if sub in {"start", "on"}:
+            if len(ctx.args) >= 2 and ctx.args[1].lower() == "seed":
+                return await _start_all_seed_jobs(ctx)
             if len(ctx.args) < 3:
                 raise ConfigError("Usage: /cron start <hours> <prompt...>")
             hours = _parse_hours(ctx.args[1])
@@ -321,6 +347,7 @@ class CronCommand:
                 hours=hours,
                 prompt_text=prompt_text,
                 notify=None,
+                entry_id="default",
                 label=None,
             )
 
@@ -358,11 +385,18 @@ async def _start_job(
     hours: float,
     prompt_text: str,
     notify: bool | None,
+    entry_id: str,
     label: str | None,
 ) -> CommandResult:
     spec = _resolve_spec(ctx, hours=hours, prompt_text=prompt_text, notify=notify)
     reply_to = ctx.reply_to or ctx.message
-    await MANAGER.start(ctx=ctx, spec=spec, reply_to=reply_to)
+    await MANAGER.start(
+        ctx=ctx,
+        entry_id=entry_id,
+        label=label,
+        spec=spec,
+        reply_to=reply_to,
+    )
     if label is None:
         return CommandResult(text=f"cron: started (every {hours:g}h)")
     return CommandResult(text=f"cron: started {label} (every {hours:g}h)")
@@ -372,6 +406,7 @@ def _help_text() -> str:
     return (
         "Usage:\n"
         "/cron start <hours> <prompt...>\n"
+        "/cron start seed\n"
         "/cron stop\n"
         "/cron status\n"
         "/cron list\n"
@@ -385,12 +420,29 @@ def _help_text() -> str:
     )
 
 
-def _format_status(entry: _CronEntry | None) -> str:
-    if entry is None:
+def _format_status(entries: list[_CronEntry]) -> str:
+    if not entries:
         return "cron: not running"
+    if len(entries) == 1:
+        return _format_single_status(entries[0])
+    lines = [
+        f"cron: running {len(entries)} jobs",
+    ]
+    for entry in entries:
+        hours = entry.spec.every_s / 3600.0
+        label = _entry_label(entry)
+        summary = f"- {label}: every {hours:g}h, notify={entry.spec.notify}, ticks={entry.tick_count}"
+        if entry.last_error:
+            summary += f", last_error={entry.last_error}"
+        lines.append(summary)
+    return "\n".join(lines)
+
+
+def _format_single_status(entry: _CronEntry) -> str:
     hours = entry.spec.every_s / 3600.0
     lines = [
         "cron: running",
+        f"- job: {_entry_label(entry)}",
         f"- interval: {hours:g}h",
         f"- notify: {entry.spec.notify}",
     ]
@@ -422,76 +474,111 @@ def _format_list(entries: list[_CronEntry]) -> str:
         where = f"{entry.key[0]!r}"
         if entry.key[1] is not None:
             where = f"{where} thread={entry.key[1]!r}"
-        lines.append(f"- {where}: every {hours:g}h (ticks={entry.tick_count})")
+        lines.append(
+            f"- {where} [{_entry_label(entry)}]: every {hours:g}h (ticks={entry.tick_count})"
+        )
     return "\n".join(lines)
 
 
 BACKEND: CommandBackend = CronCommand()
 
 
-def _parse_seed_presets(config: dict[str, Any]) -> list[SeedPreset]:
-    seeds = config.get("seed")
-    if seeds is None:
+def _entry_label(entry: _CronEntry) -> str:
+    return entry.label or "default"
+
+
+def _entry_sort_key(entry: _CronEntry) -> tuple[str, str]:
+    return (repr(entry.key), entry.entry_id)
+
+
+def _config_dir(ctx: CommandContext) -> Path:
+    if ctx.config_path is not None:
+        return ctx.config_path.expanduser().resolve().parent
+    return (Path.home() / ".takopi").resolve()
+
+
+def _seed_dir(ctx: CommandContext, config: dict[str, Any]) -> Path:
+    raw = config.get("seed_dir")
+    base_dir = _config_dir(ctx)
+    if raw is None:
+        return base_dir / "cron-seeds"
+    if not isinstance(raw, str) or not raw.strip():
+        raise ConfigError("Invalid `plugins.cron.seed_dir`; expected a string.")
+    path = Path(raw.strip()).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    return path.resolve()
+
+
+def _parse_seed_presets(ctx: CommandContext) -> list[SeedPreset]:
+    config = dict(ctx.plugin_config or {})
+    seed_dir = _seed_dir(ctx, config)
+    if not seed_dir.exists():
         return []
-    if not isinstance(seeds, list):
-        raise ConfigError("Invalid `plugins.cron.seed`; expected an array of tables.")
+    if not seed_dir.is_dir():
+        raise ConfigError(f"Invalid seed_dir {seed_dir}; expected a directory.")
 
     notify_default = _optional_bool(config, "notify")
     notify_default = True if notify_default is None else notify_default
 
     presets: list[SeedPreset] = []
     seen: set[str] = set()
-    for idx, raw in enumerate(seeds):
+    for seed_path in sorted(seed_dir.glob("*.toml")):
+        try:
+            raw = tomllib.loads(seed_path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise ConfigError(f"Invalid seed file {seed_path}: {exc}") from exc
         if not isinstance(raw, dict):
-            raise ConfigError(f"Invalid `plugins.cron.seed[{idx}]`; expected a table.")
-        if raw.get("enabled") is False:
+            raise ConfigError(f"Invalid seed file {seed_path}; expected a table.")
+        enabled = raw.get("enabled")
+        if enabled is False:
             continue
+        if enabled is not None and not isinstance(enabled, bool):
+            raise ConfigError(f"Invalid {seed_path}.enabled; expected a boolean.")
 
         preset_id = raw.get("id")
         if preset_id is None:
-            preset_id = raw.get("name")
-        if preset_id is None:
-            preset_id = str(idx + 1)
+            preset_id = seed_path.stem
         if not isinstance(preset_id, str) or not preset_id.strip():
-            raise ConfigError(
-                f"Invalid `plugins.cron.seed[{idx}].id`; expected a string."
-            )
+            raise ConfigError(f"Invalid {seed_path}.id; expected a string.")
         preset_id = preset_id.strip()
         key = preset_id.casefold()
         if key in seen:
-            raise ConfigError(f"Duplicate `plugins.cron.seed` id: {preset_id!r}.")
+            raise ConfigError(f"Duplicate seed id: {preset_id!r}.")
         seen.add(key)
 
         every_hours = raw.get("every_hours")
         if not isinstance(every_hours, (int, float)):
-            raise ConfigError(
-                f"Invalid `plugins.cron.seed[{idx}].every_hours`; expected a number."
-            )
+            raise ConfigError(f"Invalid {seed_path}.every_hours; expected a number.")
         if every_hours <= 0:
-            raise ConfigError(
-                f"Invalid `plugins.cron.seed[{idx}].every_hours`; must be > 0."
-            )
+            raise ConfigError(f"Invalid {seed_path}.every_hours; must be > 0.")
 
-        prompt = raw.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise ConfigError(
-                f"Invalid `plugins.cron.seed[{idx}].prompt`; expected a string."
-            )
+        prompt_file = raw.get("prompt_file")
+        if not isinstance(prompt_file, str) or not prompt_file.strip():
+            raise ConfigError(f"Invalid {seed_path}.prompt_file; expected a string.")
+        prompt_path = Path(prompt_file.strip()).expanduser()
+        if not prompt_path.is_absolute():
+            prompt_path = seed_path.parent / prompt_path
+        try:
+            prompt = prompt_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ConfigError(f"Failed to read prompt_file for {preset_id!r}: {exc}") from exc
+        if not prompt:
+            raise ConfigError(f"Prompt file for {preset_id!r} is empty: {prompt_path}")
 
         notify = raw.get("notify")
         if notify is None:
             notify = notify_default
         if not isinstance(notify, bool):
-            raise ConfigError(
-                f"Invalid `plugins.cron.seed[{idx}].notify`; expected a boolean."
-            )
+            raise ConfigError(f"Invalid {seed_path}.notify; expected a boolean.")
 
         presets.append(
             SeedPreset(
                 id=preset_id,
                 every_hours=float(every_hours),
-                prompt=prompt.strip(),
+                prompt=prompt,
                 notify=notify,
+                source_path=seed_path,
             )
         )
     return presets
@@ -515,9 +602,27 @@ def _format_seed_list(presets: list[SeedPreset]) -> str:
     lines = ["cron: seed presets"]
     for idx, preset in enumerate(presets, start=1):
         lines.append(
-            f"- {idx}. {preset.id}: every {preset.every_hours:g}h (notify={preset.notify})"
+            f"- {idx}. {preset.id}: every {preset.every_hours:g}h (notify={preset.notify}, file={preset.source_path.name})"
         )
     return "\n".join(lines)
+
+
+async def _start_all_seed_jobs(ctx: CommandContext) -> CommandResult:
+    presets = _parse_seed_presets(ctx)
+    if not presets:
+        return CommandResult(text="cron: no seed presets")
+    for preset in presets:
+        await _start_job(
+            ctx,
+            hours=preset.every_hours,
+            prompt_text=preset.prompt,
+            notify=preset.notify,
+            entry_id=f"seed:{preset.id}",
+            label=f"seed {preset.id}",
+        )
+    count = len(presets)
+    suffix = "job" if count == 1 else "jobs"
+    return CommandResult(text=f"cron: started {count} seed {suffix}")
 
 
 async def _handle_seed(ctx: CommandContext) -> CommandResult:
@@ -525,7 +630,7 @@ async def _handle_seed(ctx: CommandContext) -> CommandResult:
         raise ConfigError("Usage: /cron seed list | /cron seed start <id|index>")
 
     action = ctx.args[1].lower()
-    presets = _parse_seed_presets(dict(ctx.plugin_config or {}))
+    presets = _parse_seed_presets(ctx)
 
     if action == "list":
         return CommandResult(text=_format_seed_list(presets))
@@ -541,6 +646,7 @@ async def _handle_seed(ctx: CommandContext) -> CommandResult:
             hours=preset.every_hours,
             prompt_text=preset.prompt,
             notify=preset.notify,
+            entry_id=f"seed:{preset.id}",
             label=f"seed {preset.id}",
         )
 
