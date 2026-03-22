@@ -443,6 +443,30 @@ async def test_seed_list_and_seed_start_runs_from_takopi_toml_config(tmp_path: P
 
 
 @pytest.mark.anyio
+async def test_seed_requires_prompt_file_after_cutover(tmp_path: Path) -> None:
+    config_path = tmp_path / "takopi.toml"
+    config_path.write_text("", encoding="utf-8")
+    ctx, _ = _make_ctx(
+        args=("seed", "list"),
+        args_text="seed list",
+        plugin_config={
+            "seed": [
+                {
+                    "id": "legacy",
+                    "every_hours": 1,
+                    "prompt": "legacy inline prompt",
+                }
+            ]
+        },
+        config_path=config_path,
+        channel_id=107,
+    )
+    result = await BACKEND.handle(ctx)
+    assert isinstance(result, CommandResult)
+    assert "prompt_file" in result.text
+
+
+@pytest.mark.anyio
 async def test_start_seed_runs_all_seed_jobs(tmp_path: Path) -> None:
     config_path = tmp_path / "takopi.toml"
     config_path.write_text("", encoding="utf-8")

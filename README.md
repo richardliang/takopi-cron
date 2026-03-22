@@ -88,6 +88,36 @@ Tips:
 - Put a project directive at the start of the prompt, e.g. `/myproj ...`
 - Put a branch directive at the start of the prompt, e.g. `@feat/foo ...`
 
+## breaking changes
+
+Breaking changes in `0.1.0`:
+
+- `plugins.cron.seed[].prompt` was removed
+- `plugins.cron.seed[].prompt_file` is now required
+- `prompt_file` is resolved relative to the directory containing `takopi.toml`
+- `/cron stop` now stops all cron jobs running in the current chat/thread, not just one
+- `/cron start seed` now starts every configured seed preset in the current chat/thread
+
+Migration example:
+
+Before:
+
+```toml
+[[plugins.cron.seed]]
+id = "daily_summary"
+every_hours = 6
+prompt = "/codex summarize what changed since the last cron tick"
+```
+
+After:
+
+```toml
+[[plugins.cron.seed]]
+id = "daily_summary"
+every_hours = 6
+prompt_file = "cron-prompts/daily_summary.prompt.md"
+```
+
 ## config
 
 In `~/.takopi/takopi.toml`:
