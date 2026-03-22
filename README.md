@@ -68,7 +68,7 @@ Run once (no scheduling):
 /cron run What changed since yesterday?
 ```
 
-Seed presets (from seed files):
+Seed presets (configured in `takopi.toml`):
 
 ```text
 /cron seed list
@@ -100,45 +100,27 @@ allowed_user_ids = [12345678]
 # Optional: whether cron ticks should notify (default: true)
 notify = true
 
-# Optional: where seed preset files live. Defaults to ~/.takopi/cron-seeds.
-# Relative paths resolve from the directory containing takopi.toml.
-# seed_dir = "cron-seeds"
-```
-
-Seed presets are no longer defined inline in `takopi.toml`. Put them in
-`~/.takopi/cron-seeds/` instead.
-
-Why use a per-seed `.toml` file plus a prompt file?
-
-- `takopi.toml` only needs one link: `seed_dir`
-- each seed still needs metadata like `every_hours`, `notify`, and an optional `id`
-- keeping that metadata next to the prompt file avoids re-growing `takopi.toml` as
-  you add more seeds
-
-In other words: the directory is linked from the main TOML, not each seed
-individually.
-
-Example seed files:
-
-```text
-~/.takopi/
-  takopi.toml
-  cron-seeds/
-    daily_summary.toml
-    daily_summary.prompt.md
-```
-
-`~/.takopi/cron-seeds/daily_summary.toml`
-
-```toml
+# Optional: seed presets. prompts live in separate files so takopi.toml stays
+# smaller, but the schedule metadata stays here.
+[[plugins.cron.seed]]
+id = "daily_summary"
 every_hours = 6
-prompt_file = "daily_summary.prompt.md"
-# id = "daily_summary"     # optional; defaults to the file name
+prompt_file = "cron-prompts/daily_summary.prompt.md"
 # notify = true            # optional override
 # enabled = false          # optional
 ```
 
-`~/.takopi/cron-seeds/daily_summary.prompt.md`
+`prompt_file` is resolved relative to the directory containing `takopi.toml`, so
+this layout works:
+
+```text
+~/.takopi/
+  takopi.toml
+  cron-prompts/
+    daily_summary.prompt.md
+```
+
+`~/.takopi/cron-prompts/daily_summary.prompt.md`
 
 ```text
 /codex summarize what changed since the last cron tick

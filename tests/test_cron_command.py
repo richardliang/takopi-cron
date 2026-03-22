@@ -197,21 +197,14 @@ def _write_seed(
     base_dir: Path,
     *,
     name: str,
-    every_hours: float,
     prompt: str,
-    notify: bool | None = None,
-    enabled: bool | None = None,
-) -> None:
-    seed_dir = base_dir / "cron-seeds"
-    seed_dir.mkdir(parents=True, exist_ok=True)
+    subdir: str = "cron-prompts",
+) -> str:
+    prompt_dir = base_dir / subdir
+    prompt_dir.mkdir(parents=True, exist_ok=True)
     prompt_name = f"{name}.prompt.md"
-    lines = [f'every_hours = {every_hours}', f'prompt_file = "{prompt_name}"']
-    if notify is not None:
-        lines.append(f"notify = {str(notify).lower()}")
-    if enabled is not None:
-        lines.append(f"enabled = {str(enabled).lower()}")
-    (seed_dir / f"{name}.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    (seed_dir / prompt_name).write_text(prompt, encoding="utf-8")
+    (prompt_dir / prompt_name).write_text(prompt, encoding="utf-8")
+    return f"{subdir}/{prompt_name}"
 
 
 @pytest.mark.anyio
@@ -389,28 +382,33 @@ async def test_slack_cron_ticks_post_in_threads_and_key_by_thread() -> None:
 
 
 @pytest.mark.anyio
-async def test_seed_list_and_seed_start_runs_from_seed_files(tmp_path: Path) -> None:
+async def test_seed_list_and_seed_start_runs_from_takopi_toml_config(tmp_path: Path) -> None:
     config_path = tmp_path / "takopi.toml"
     config_path.write_text("", encoding="utf-8")
-    _write_seed(
-        tmp_path,
-        name="quick",
-        every_hours=0.00001,
-        prompt="hello from seed",
-        notify=True,
-    )
-    _write_seed(
-        tmp_path,
-        name="disabled",
-        every_hours=1,
-        prompt="disabled",
-        enabled=False,
-    )
+    quick_prompt = _write_seed(tmp_path, name="quick", prompt="hello from seed")
+    disabled_prompt = _write_seed(tmp_path, name="disabled", prompt="disabled")
+    plugin_config = {
+        "notify": False,
+        "seed": [
+            {
+                "id": "quick",
+                "every_hours": 0.00001,
+                "prompt_file": quick_prompt,
+                "notify": True,
+            },
+            {
+                "id": "disabled",
+                "every_hours": 1,
+                "prompt_file": disabled_prompt,
+                "enabled": False,
+            },
+        ],
+    }
 
     list_ctx, _ = _make_ctx(
         args=("seed", "list"),
         args_text="seed list",
-        plugin_config={"notify": False},
+        plugin_config=plugin_config,
         config_path=config_path,
         channel_id=105,
     )
@@ -423,7 +421,7 @@ async def test_seed_list_and_seed_start_runs_from_seed_files(tmp_path: Path) -> 
     start_ctx, exec_ = _make_ctx(
         args=("seed", "start", "quick"),
         args_text="seed start quick",
-        plugin_config={"notify": False},
+        plugin_config=plugin_config,
         config_path=config_path,
         executor=_FakeExecutor(answer="RESULT"),
         channel_id=105,
@@ -448,24 +446,28 @@ async def test_seed_list_and_seed_start_runs_from_seed_files(tmp_path: Path) -> 
 async def test_start_seed_runs_all_seed_jobs(tmp_path: Path) -> None:
     config_path = tmp_path / "takopi.toml"
     config_path.write_text("", encoding="utf-8")
-    _write_seed(
-        tmp_path,
-        name="quick",
-        every_hours=0.00001,
-        prompt="hello from quick seed",
-    )
-    _write_seed(
-        tmp_path,
-        name="review",
-        every_hours=0.00001,
-        prompt="hello from review seed",
-        notify=False,
-    )
+    quick_prompt = _write_seed(tmp_path, name="quick", prompt="hello from quick seed")
+    review_prompt = _write_seed(tmp_path, name="review", prompt="hello from review seed")
+    plugin_config = {
+        "seed": [
+            {
+                "id": "quick",
+                "every_hours": 0.00001,
+                "prompt_file": quick_prompt,
+            },
+            {
+                "id": "review",
+                "every_hours": 0.00001,
+                "prompt_file": review_prompt,
+                "notify": False,
+            },
+        ]
+    }
 
     start_ctx, exec_ = _make_ctx(
         args=("start", "seed"),
         args_text="start seed",
-        plugin_config={},
+        plugin_config=plugin_config,
         config_path=config_path,
         executor=_FakeExecutor(answer="RESULT"),
         channel_id=106,
@@ -492,7 +494,7 @@ async def test_start_seed_runs_all_seed_jobs(tmp_path: Path) -> None:
         status_ctx, _ = _make_ctx(
             args=("status",),
             args_text="status",
-            plugin_config={},
+            plugin_config=plugin_config,
             config_path=config_path,
             channel_id=106,
         )

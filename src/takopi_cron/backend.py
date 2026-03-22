@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -92,7 +91,7 @@ class SeedPreset:
     every_hours: float
     prompt: str
     notify: bool
-    source_path: Path
+    prompt_file: str
 
 
 @dataclass(slots=True)
@@ -497,50 +496,40 @@ def _config_dir(ctx: CommandContext) -> Path:
     return (Path.home() / ".takopi").resolve()
 
 
-def _seed_dir(ctx: CommandContext, config: dict[str, Any]) -> Path:
-    raw = config.get("seed_dir")
-    base_dir = _config_dir(ctx)
-    if raw is None:
-        return base_dir / "cron-seeds"
-    if not isinstance(raw, str) or not raw.strip():
-        raise ConfigError("Invalid `plugins.cron.seed_dir`; expected a string.")
-    path = Path(raw.strip()).expanduser()
-    if not path.is_absolute():
-        path = base_dir / path
-    return path.resolve()
-
-
 def _parse_seed_presets(ctx: CommandContext) -> list[SeedPreset]:
     config = dict(ctx.plugin_config or {})
-    seed_dir = _seed_dir(ctx, config)
-    if not seed_dir.exists():
+    seeds = config.get("seed")
+    if seeds is None:
         return []
-    if not seed_dir.is_dir():
-        raise ConfigError(f"Invalid seed_dir {seed_dir}; expected a directory.")
+    if not isinstance(seeds, list):
+        raise ConfigError("Invalid `plugins.cron.seed`; expected an array of tables.")
 
     notify_default = _optional_bool(config, "notify")
     notify_default = True if notify_default is None else notify_default
 
     presets: list[SeedPreset] = []
     seen: set[str] = set()
-    for seed_path in sorted(seed_dir.glob("*.toml")):
-        try:
-            raw = tomllib.loads(seed_path.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError) as exc:
-            raise ConfigError(f"Invalid seed file {seed_path}: {exc}") from exc
+    base_dir = _config_dir(ctx)
+    for idx, raw in enumerate(seeds):
         if not isinstance(raw, dict):
-            raise ConfigError(f"Invalid seed file {seed_path}; expected a table.")
+            raise ConfigError(f"Invalid `plugins.cron.seed[{idx}]`; expected a table.")
         enabled = raw.get("enabled")
         if enabled is False:
             continue
         if enabled is not None and not isinstance(enabled, bool):
-            raise ConfigError(f"Invalid {seed_path}.enabled; expected a boolean.")
+            raise ConfigError(
+                f"Invalid `plugins.cron.seed[{idx}].enabled`; expected a boolean."
+            )
 
         preset_id = raw.get("id")
         if preset_id is None:
-            preset_id = seed_path.stem
+            preset_id = raw.get("name")
+        if preset_id is None:
+            preset_id = str(idx + 1)
         if not isinstance(preset_id, str) or not preset_id.strip():
-            raise ConfigError(f"Invalid {seed_path}.id; expected a string.")
+            raise ConfigError(
+                f"Invalid `plugins.cron.seed[{idx}].id`; expected a string."
+            )
         preset_id = preset_id.strip()
         key = preset_id.casefold()
         if key in seen:
@@ -549,16 +538,23 @@ def _parse_seed_presets(ctx: CommandContext) -> list[SeedPreset]:
 
         every_hours = raw.get("every_hours")
         if not isinstance(every_hours, (int, float)):
-            raise ConfigError(f"Invalid {seed_path}.every_hours; expected a number.")
+            raise ConfigError(
+                f"Invalid `plugins.cron.seed[{idx}].every_hours`; expected a number."
+            )
         if every_hours <= 0:
-            raise ConfigError(f"Invalid {seed_path}.every_hours; must be > 0.")
+            raise ConfigError(
+                f"Invalid `plugins.cron.seed[{idx}].every_hours`; must be > 0."
+            )
 
         prompt_file = raw.get("prompt_file")
         if not isinstance(prompt_file, str) or not prompt_file.strip():
-            raise ConfigError(f"Invalid {seed_path}.prompt_file; expected a string.")
+            raise ConfigError(
+                f"Invalid `plugins.cron.seed[{idx}].prompt_file`; expected a string."
+            )
+        prompt_file = prompt_file.strip()
         prompt_path = Path(prompt_file.strip()).expanduser()
         if not prompt_path.is_absolute():
-            prompt_path = seed_path.parent / prompt_path
+            prompt_path = base_dir / prompt_path
         try:
             prompt = prompt_path.read_text(encoding="utf-8").strip()
         except OSError as exc:
@@ -570,7 +566,9 @@ def _parse_seed_presets(ctx: CommandContext) -> list[SeedPreset]:
         if notify is None:
             notify = notify_default
         if not isinstance(notify, bool):
-            raise ConfigError(f"Invalid {seed_path}.notify; expected a boolean.")
+            raise ConfigError(
+                f"Invalid `plugins.cron.seed[{idx}].notify`; expected a boolean."
+            )
 
         presets.append(
             SeedPreset(
@@ -578,7 +576,7 @@ def _parse_seed_presets(ctx: CommandContext) -> list[SeedPreset]:
                 every_hours=float(every_hours),
                 prompt=prompt,
                 notify=notify,
-                source_path=seed_path,
+                prompt_file=prompt_file,
             )
         )
     return presets
@@ -602,7 +600,7 @@ def _format_seed_list(presets: list[SeedPreset]) -> str:
     lines = ["cron: seed presets"]
     for idx, preset in enumerate(presets, start=1):
         lines.append(
-            f"- {idx}. {preset.id}: every {preset.every_hours:g}h (notify={preset.notify}, file={preset.source_path.name})"
+            f"- {idx}. {preset.id}: every {preset.every_hours:g}h (notify={preset.notify}, prompt_file={preset.prompt_file})"
         )
     return "\n".join(lines)
 
