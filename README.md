@@ -68,20 +68,55 @@ Run once (no scheduling):
 /cron run What changed since yesterday?
 ```
 
-Seed presets (from config):
+Seed presets (configured in `takopi.toml`):
 
 ```text
 /cron seed list
 /cron seed start daily_summary
+/cron start seed
 ```
 
-Seed presets start in the chat/thread where you run the command.
+Seed presets start in the chat/thread where you run the command. `/cron start seed`
+starts every seed preset at once in that chat/thread.
+
+If you start multiple seed jobs in one chat/thread, `/cron stop` stops all of them
+for that chat/thread.
 
 Tips:
 
 - Put an engine directive at the start of the prompt, e.g. `/claude ...`
 - Put a project directive at the start of the prompt, e.g. `/myproj ...`
 - Put a branch directive at the start of the prompt, e.g. `@feat/foo ...`
+
+## breaking changes
+
+Breaking changes in `0.1.0`:
+
+- `plugins.cron.seed[].prompt` was removed
+- `plugins.cron.seed[].prompt_file` is now required
+- `prompt_file` is resolved relative to the directory containing `takopi.toml`
+- `/cron stop` now stops all cron jobs running in the current chat/thread, not just one
+- `/cron start seed` now starts every configured seed preset in the current chat/thread
+
+Migration example:
+
+Before:
+
+```toml
+[[plugins.cron.seed]]
+id = "daily_summary"
+every_hours = 6
+prompt = "/codex summarize what changed since the last cron tick"
+```
+
+After:
+
+```toml
+[[plugins.cron.seed]]
+id = "daily_summary"
+every_hours = 6
+prompt_file = "cron-prompts/daily_summary.prompt.md"
+```
 
 ## config
 
@@ -95,12 +130,28 @@ allowed_user_ids = [12345678]
 # Optional: whether cron ticks should notify (default: true)
 notify = true
 
-# Optional: seed presets (saved cron definitions). they do not auto-start; you
-# start them later with `/cron seed start ...`.
+# Optional: seed presets. prompts live in separate files so takopi.toml stays
+# smaller, but the schedule metadata stays here.
 [[plugins.cron.seed]]
 id = "daily_summary"
 every_hours = 6
-prompt = "/codex summarize what changed since the last cron tick"
+prompt_file = "cron-prompts/daily_summary.prompt.md"
 # notify = true            # optional override
 # enabled = false          # optional
+```
+
+`prompt_file` is resolved relative to the directory containing `takopi.toml`, so
+this layout works:
+
+```text
+~/.takopi/
+  takopi.toml
+  cron-prompts/
+    daily_summary.prompt.md
+```
+
+`~/.takopi/cron-prompts/daily_summary.prompt.md`
+
+```text
+/codex summarize what changed since the last cron tick
 ```

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -157,6 +158,7 @@ def _make_ctx(
     args: tuple[str, ...],
     args_text: str,
     plugin_config: dict[str, Any] | None = None,
+    config_path: Path | None = None,
     sender_id: int | None = 1,
     channel_id: int | str = 123,
     thread_id: int | str | None = None,
@@ -183,12 +185,26 @@ def _make_ctx(
         message=msg,
         reply_to=reply_to,
         reply_text=reply_text,
-        config_path=None,
+        config_path=config_path,
         plugin_config=plugin_config or {},
         runtime=runtime,
         executor=executor,
     )
     return ctx, executor
+
+
+def _write_seed(
+    base_dir: Path,
+    *,
+    name: str,
+    prompt: str,
+    subdir: str = "cron-prompts",
+) -> str:
+    prompt_dir = base_dir / subdir
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    prompt_name = f"{name}.prompt.md"
+    (prompt_dir / prompt_name).write_text(prompt, encoding="utf-8")
+    return f"{subdir}/{prompt_name}"
 
 
 @pytest.mark.anyio
@@ -216,7 +232,7 @@ async def test_start_runs_immediately_and_repeats() -> None:
         assert "cron tick #2" in exec_.send_calls[2]["message"].text
         assert exec_.send_calls[3]["message"].text == "RESULT"
     finally:
-        await MANAGER.stop(key=(ctx.message.channel_id, ctx.message.thread_id))
+        await MANAGER.stop_all(key=(ctx.message.channel_id, ctx.message.thread_id))
 
 
 @pytest.mark.anyio
@@ -248,7 +264,7 @@ async def test_stop_prevents_future_ticks() -> None:
         await anyio.sleep(0.6)
         assert len(exec_.send_calls) == 2
     finally:
-        await MANAGER.stop(key=(ctx.message.channel_id, ctx.message.thread_id))
+        await MANAGER.stop_all(key=(ctx.message.channel_id, ctx.message.thread_id))
 
 
 @pytest.mark.anyio
@@ -300,7 +316,7 @@ async def test_notify_config_applies_to_ticks() -> None:
                 await anyio.sleep(0.01)
         assert exec_.send_calls[0]["notify"] is False
     finally:
-        await MANAGER.stop(key=(ctx.message.channel_id, ctx.message.thread_id))
+        await MANAGER.stop_all(key=(ctx.message.channel_id, ctx.message.thread_id))
 
 
 @pytest.mark.anyio
@@ -361,22 +377,31 @@ async def test_slack_cron_ticks_post_in_threads_and_key_by_thread() -> None:
         keys = {entry.key for entry in entries}
         assert keys == {("C1", "t1"), ("C1", "t2")}
     finally:
-        await MANAGER.stop(key=("C1", "t1"))
-        await MANAGER.stop(key=("C1", "t2"))
+        await MANAGER.stop_all(key=("C1", "t1"))
+        await MANAGER.stop_all(key=("C1", "t2"))
 
 
 @pytest.mark.anyio
-async def test_seed_list_and_seed_start_runs() -> None:
+async def test_seed_list_and_seed_start_runs_from_takopi_toml_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "takopi.toml"
+    config_path.write_text("", encoding="utf-8")
+    quick_prompt = _write_seed(tmp_path, name="quick", prompt="hello from seed")
+    disabled_prompt = _write_seed(tmp_path, name="disabled", prompt="disabled")
     plugin_config = {
         "notify": False,
         "seed": [
             {
                 "id": "quick",
                 "every_hours": 0.00001,
-                "prompt": "hello from seed",
+                "prompt_file": quick_prompt,
                 "notify": True,
             },
-            {"every_hours": 1, "prompt": "disabled", "enabled": False},
+            {
+                "id": "disabled",
+                "every_hours": 1,
+                "prompt_file": disabled_prompt,
+                "enabled": False,
+            },
         ],
     }
 
@@ -384,17 +409,20 @@ async def test_seed_list_and_seed_start_runs() -> None:
         args=("seed", "list"),
         args_text="seed list",
         plugin_config=plugin_config,
+        config_path=config_path,
         channel_id=105,
     )
     listed = await BACKEND.handle(list_ctx)
     assert isinstance(listed, CommandResult)
     assert "seed presets" in listed.text
     assert "quick" in listed.text
+    assert "disabled" not in listed.text
 
     start_ctx, exec_ = _make_ctx(
         args=("seed", "start", "quick"),
         args_text="seed start quick",
         plugin_config=plugin_config,
+        config_path=config_path,
         executor=_FakeExecutor(answer="RESULT"),
         channel_id=105,
     )
@@ -406,9 +434,98 @@ async def test_seed_list_and_seed_start_runs() -> None:
         with anyio.fail_after(1):
             while len(exec_.send_calls) < 2:
                 await anyio.sleep(0.01)
-        assert "cron tick #1" in exec_.send_calls[0]["message"].text
+        assert "cron seed quick tick #1" in exec_.send_calls[0]["message"].text
         assert exec_.send_calls[0]["notify"] is True
         assert exec_.send_calls[1]["message"].text == "RESULT"
         assert exec_.send_calls[1]["notify"] is False
     finally:
-        await MANAGER.stop(key=(start_ctx.message.channel_id, start_ctx.message.thread_id))
+        await MANAGER.stop_all(key=(start_ctx.message.channel_id, start_ctx.message.thread_id))
+
+
+@pytest.mark.anyio
+async def test_seed_requires_prompt_file_after_cutover(tmp_path: Path) -> None:
+    config_path = tmp_path / "takopi.toml"
+    config_path.write_text("", encoding="utf-8")
+    ctx, _ = _make_ctx(
+        args=("seed", "list"),
+        args_text="seed list",
+        plugin_config={
+            "seed": [
+                {
+                    "id": "legacy",
+                    "every_hours": 1,
+                    "prompt": "legacy inline prompt",
+                }
+            ]
+        },
+        config_path=config_path,
+        channel_id=107,
+    )
+    result = await BACKEND.handle(ctx)
+    assert isinstance(result, CommandResult)
+    assert "prompt_file" in result.text
+
+
+@pytest.mark.anyio
+async def test_start_seed_runs_all_seed_jobs(tmp_path: Path) -> None:
+    config_path = tmp_path / "takopi.toml"
+    config_path.write_text("", encoding="utf-8")
+    quick_prompt = _write_seed(tmp_path, name="quick", prompt="hello from quick seed")
+    review_prompt = _write_seed(tmp_path, name="review", prompt="hello from review seed")
+    plugin_config = {
+        "seed": [
+            {
+                "id": "quick",
+                "every_hours": 0.00001,
+                "prompt_file": quick_prompt,
+            },
+            {
+                "id": "review",
+                "every_hours": 0.00001,
+                "prompt_file": review_prompt,
+                "notify": False,
+            },
+        ]
+    }
+
+    start_ctx, exec_ = _make_ctx(
+        args=("start", "seed"),
+        args_text="start seed",
+        plugin_config=plugin_config,
+        config_path=config_path,
+        executor=_FakeExecutor(answer="RESULT"),
+        channel_id=106,
+    )
+    try:
+        started = await BACKEND.handle(start_ctx)
+        assert isinstance(started, CommandResult)
+        assert started.text == "cron: started 2 seed jobs"
+
+        with anyio.fail_after(1):
+            while len(exec_.run_calls) < 2:
+                await anyio.sleep(0.01)
+
+        prompts = {call[0].prompt for call in exec_.run_calls[:2]}
+        assert prompts == {"hello from quick seed", "hello from review seed"}
+
+        with anyio.fail_after(1):
+            while len(exec_.send_calls) < 4:
+                await anyio.sleep(0.01)
+        headers = {exec_.send_calls[0]["message"].text, exec_.send_calls[2]["message"].text}
+        assert any("cron seed quick tick #1" in header for header in headers)
+        assert any("cron seed review tick #1" in header for header in headers)
+
+        status_ctx, _ = _make_ctx(
+            args=("status",),
+            args_text="status",
+            plugin_config=plugin_config,
+            config_path=config_path,
+            channel_id=106,
+        )
+        status = await BACKEND.handle(status_ctx)
+        assert isinstance(status, CommandResult)
+        assert status.text.startswith("cron: running 2 jobs")
+        assert "seed quick" in status.text
+        assert "seed review" in status.text
+    finally:
+        await MANAGER.stop_all(key=(start_ctx.message.channel_id, start_ctx.message.thread_id))
