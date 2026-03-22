@@ -68,7 +68,7 @@ Run once (no scheduling):
 /cron run What changed since yesterday?
 ```
 
-Seed presets (from config):
+Seed presets (from seed files):
 
 ```text
 /cron seed list
@@ -78,6 +78,9 @@ Seed presets (from config):
 
 Seed presets start in the chat/thread where you run the command. `/cron start seed`
 starts every seed preset at once in that chat/thread.
+
+If you start multiple seed jobs in one chat/thread, `/cron stop` stops all of them
+for that chat/thread.
 
 Tips:
 
@@ -105,7 +108,25 @@ notify = true
 Seed presets are no longer defined inline in `takopi.toml`. Put them in
 `~/.takopi/cron-seeds/` instead.
 
+Why use a per-seed `.toml` file plus a prompt file?
+
+- `takopi.toml` only needs one link: `seed_dir`
+- each seed still needs metadata like `every_hours`, `notify`, and an optional `id`
+- keeping that metadata next to the prompt file avoids re-growing `takopi.toml` as
+  you add more seeds
+
+In other words: the directory is linked from the main TOML, not each seed
+individually.
+
 Example seed files:
+
+```text
+~/.takopi/
+  takopi.toml
+  cron-seeds/
+    daily_summary.toml
+    daily_summary.prompt.md
+```
 
 `~/.takopi/cron-seeds/daily_summary.toml`
 
